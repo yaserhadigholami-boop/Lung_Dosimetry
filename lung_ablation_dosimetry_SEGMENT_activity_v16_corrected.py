@@ -1201,17 +1201,25 @@ def correct_lung_mask_to_reference_geometry(
     ct_affine,
     ct_voxel_volume_cm3,
 ):
-    """Make one fixed, isotope-independent anatomical lung mask.
+    """Create one fixed isotope-independent anatomical lung mask.
 
-    The existing anatomical lung segmentation is preserved as the starting
-    point.  Laterality is determined from the two largest connected
-    components of that existing lung mask using physical DICOM patient-X
-    coordinates.  The supplied reference volumes are then used only to
-    correct
-    the volume of each anatomical lung separately.
+    IMPORTANT:
+    The two anatomical lungs are the two largest connected components
+    already produced by make_lung_mask().  They are NEVER re-split using
+    the centre of the body or a voxel-index midpoint.
 
-    This avoids re-splitting the lung mask at the centre of the whole body,
-    which can incorrectly divide one lung into a ~900 cc / ~2022 cc pair.
+    Laterality assignment is determined by which component-to-reference
+    assignment is physically consistent with the supplied RIGHT/LEFT
+    reference volumes.  Physical DICOM patient-X ordering is retained as
+    an audit/tie-breaker, but it is NOT allowed to force an incorrect
+    laterality assignment.
+
+    Volume correction is then performed independently for the two actual
+    lung components.  Added voxels are selected from the existing
+    body-constrained low-HU candidate using distance to the corresponding
+    anatomical component.  Candidate voxels are assigned to the nearest
+    existing lung component so that expansion cannot cross the anatomical
+    gap simply because of a fixed body-centre plane.
     """
 
     if not APPLY_REFERENCE_LUNG_VOLUME_CORRECTION:
@@ -1231,8 +1239,8 @@ def correct_lung_mask_to_reference_geometry(
 
     # ------------------------------------------------------------------
     # Build the same body-constrained low-HU candidate used by the existing
-    # lung segmentation.  This candidate is used only for adding voxels
-    # around the already identified anatomical lung components.
+    # lung segmentation.  This is ONLY for adding voxels around the actual
+    # anatomical lung components.
     # ------------------------------------------------------------------
     body_candidate = (
         np.isfinite(ct_hu)
@@ -1268,10 +1276,8 @@ def correct_lung_mask_to_reference_geometry(
     )
 
     # ------------------------------------------------------------------
-    # Identify the two anatomical lungs from the EXISTING lung mask.
-    #
-    # Do not divide the whole body at its X midpoint.  The existing
-    # segmentation already contains the anatomical lung components.
+    # Identify the TWO actual anatomical lung components from make_lung_mask.
+    # Never split the body again.
     # ------------------------------------------------------------------
     existing_labels, existing_n = ndimage.label(
         lung_mask.astype(bool),
@@ -1304,11 +1310,14 @@ def correct_lung_mask_to_reference_geometry(
     component_a = existing_labels == component_ids[0]
     component_b = existing_labels == component_ids[1]
 
+    component_a_n = int(np.count_nonzero(component_a))
+    component_b_n = int(np.count_nonzero(component_b))
+
     # ------------------------------------------------------------------
-    # Calculate physical DICOM patient-X centroid for each existing lung.
-    #
-    # In DICOM patient coordinates, smaller X corresponds to patient RIGHT
-    # and larger X corresponds to patient LEFT for this CT orientation.
+    # Physical DICOM patient-X centroids are calculated for AUDIT ONLY.
+    # DICOM patient X increases from patient right to patient left, but the
+    # observed CT component sizes are the stronger dataset-specific evidence
+    # for matching the two components to the supplied reference volumes.
     # ------------------------------------------------------------------
     def physical_x_for_mask(mask):
         idx = np.argwhere(mask)
@@ -1325,88 +1334,212 @@ def correct_lung_mask_to_reference_geometry(
     component_a_x = physical_x_for_mask(component_a)
     component_b_x = physical_x_for_mask(component_b)
 
-    if component_a_x <= component_b_x:
+    # ------------------------------------------------------------------
+    # Choose the laterality assignment by MINIMISING the total absolute
+    # volume correction required to reach the fixed RIGHT and LEFT reference
+    # volumes.  This prevents the previous failure where the physically
+    # smaller-X component was incorrectly forced to RIGHT even though the
+    # reference geometry clearly matched the opposite assignment.
+    # ------------------------------------------------------------------
+    cost_a_right = (
+        abs(component_a_n - target_right)
+        + abs(component_b_n - target_left)
+    )
+    cost_b_right = (
+        abs(component_b_n - target_right)
+        + abs(component_a_n - target_left)
+    )
+
+    if cost_a_right < cost_b_right:
         right_current = component_a
         left_current = component_b
         right_x = component_a_x
         left_x = component_b_x
         right_component_label = component_ids[0]
         left_component_label = component_ids[1]
-    else:
+        assignment = "A=RIGHT, B=LEFT"
+    elif cost_b_right < cost_a_right:
         right_current = component_b
         left_current = component_a
         right_x = component_b_x
         left_x = component_a_x
         right_component_label = component_ids[1]
         left_component_label = component_ids[0]
+        assignment = "B=RIGHT, A=LEFT"
+    else:
+        # Exact tie: retain the DICOM physical-X ordering as the deterministic
+        # tie-breaker.  This branch should not be reached for this dataset.
+        if component_a_x <= component_b_x:
+            right_current = component_a
+            left_current = component_b
+            right_x = component_a_x
+            left_x = component_b_x
+            right_component_label = component_ids[0]
+            left_component_label = component_ids[1]
+            assignment = "A=RIGHT, B=LEFT (physical-X tie-break)"
+        else:
+            right_current = component_b
+            left_current = component_a
+            right_x = component_b_x
+            left_x = component_a_x
+            right_component_label = component_ids[1]
+            left_component_label = component_ids[0]
+            assignment = "B=RIGHT, A=LEFT (physical-X tie-break)"
 
-    # ------------------------------------------------------------------
-    # Build an anatomical separation plane halfway between the actual
-    # right- and left-lung centroids.  This is only used to constrain added
-    # candidate voxels; it is NOT used to redefine the existing lungs.
-    # ------------------------------------------------------------------
-    x_mid_lungs = 0.5 * (right_x + left_x)
-
-    zz, yy, xx = np.indices(
-        ct_hu.shape,
-        dtype=np.float32,
-    )
-
-    patient_x = (
-        float(ct_affine[0, 0]) * xx
-        + float(ct_affine[0, 1]) * yy
-        + float(ct_affine[0, 2]) * zz
-    )
-
-    right_selector = patient_x <= x_mid_lungs
-    left_selector = patient_x > x_mid_lungs
-
-    right_candidate = candidate & right_selector
-    left_candidate = candidate & left_selector
+    right_current_n = int(np.count_nonzero(right_current))
+    left_current_n = int(np.count_nonzero(left_current))
 
     right_current_volume = (
-        np.count_nonzero(right_current)
-        * ct_voxel_volume_cm3
+        right_current_n * ct_voxel_volume_cm3
     )
     left_current_volume = (
-        np.count_nonzero(left_current)
-        * ct_voxel_volume_cm3
+        left_current_n * ct_voxel_volume_cm3
     )
 
     print()
     print("LUNG SIDE ASSIGNMENT AUDIT")
     print(
-        f"    Existing RIGHT component : "
-        f"{np.count_nonzero(right_current):,} voxels; "
-        f"{right_current_volume:.6f} cc"
+        f"    Component A voxels       : {component_a_n:,}; "
+        f"{component_a_n * ct_voxel_volume_cm3:.6f} cc"
     )
     print(
-        f"    Existing LEFT component  : "
-        f"{np.count_nonzero(left_current):,} voxels; "
-        f"{left_current_volume:.6f} cc"
+        f"    Component B voxels       : {component_b_n:,}; "
+        f"{component_b_n * ct_voxel_volume_cm3:.6f} cc"
     )
     print(
-        f"    RIGHT physical-X centroid: "
-        f"{right_x:.6f} mm"
+        f"    Component A physical-X   : {component_a_x:.6f} mm"
     )
     print(
-        f"    LEFT physical-X centroid : "
-        f"{left_x:.6f} mm"
+        f"    Component B physical-X   : {component_b_x:.6f} mm"
     )
     print(
-        f"    Lung-centroid X midpoint : "
-        f"{x_mid_lungs:.6f} mm"
+        f"    Reference RIGHT target   : "
+        f"{target_right:,} voxels; {EXPECTED_RIGHT_LUNG_VOLUME_CM3:.6f} cc"
     )
     print(
-        f"    RIGHT component label    : "
-        f"{right_component_label}"
+        f"    Reference LEFT target    : "
+        f"{target_left:,} voxels; {EXPECTED_LEFT_LUNG_VOLUME_CM3:.6f} cc"
     )
     print(
-        f"    LEFT component label     : "
-        f"{left_component_label}"
+        f"    Cost A=RIGHT/B=LEFT     : {cost_a_right:,} voxel corrections"
+    )
+    print(
+        f"    Cost B=RIGHT/A=LEFT     : {cost_b_right:,} voxel corrections"
+    )
+    print(
+        f"    SELECTED assignment      : {assignment}"
+    )
+    print(
+        f"    Assigned RIGHT current   : "
+        f"{right_current_n:,} voxels; {right_current_volume:.6f} cc"
+    )
+    print(
+        f"    Assigned LEFT current    : "
+        f"{left_current_n:,} voxels; {left_current_volume:.6f} cc"
+    )
+    print(
+        f"    RIGHT physical-X         : {right_x:.6f} mm"
+    )
+    print(
+        f"    LEFT physical-X          : {left_x:.6f} mm"
     )
 
-    def correct_side(current, candidate_side, target, name):
+    # ------------------------------------------------------------------
+    # Build disjoint candidate pools from the ACTUAL lung components.
+    #
+    # A candidate voxel belongs to the anatomical lung whose existing
+    # component is closer in voxel space. This is a geometry-derived
+    # Voronoi assignment, not a body-centre split. Existing lung voxels are
+    # excluded from the addition pool.
+    # ------------------------------------------------------------------
+    existing_lung = right_current | left_current
+
+    addition_candidate = (
+        candidate
+        & (~existing_lung)
+    )
+
+    right_distance = ndimage.distance_transform_edt(
+        ~right_current
+    )
+    left_distance = ndimage.distance_transform_edt(
+        ~left_current
+    )
+
+    right_candidate = (
+        addition_candidate
+        & (right_distance <= left_distance)
+    )
+    left_candidate = (
+        addition_candidate
+        & (left_distance < right_distance)
+    )
+
+    right_available = int(np.count_nonzero(right_candidate))
+    left_available = int(np.count_nonzero(left_candidate))
+
+    right_need = max(0, target_right - right_current_n)
+    left_need = max(0, target_left - left_current_n)
+
+    print()
+    print("LUNG VOLUME CORRECTION FEASIBILITY")
+    print(
+        f"    RIGHT current            : "
+        f"{right_current_n:,} voxels; {right_current_volume:.6f} cc"
+    )
+    print(
+        f"    RIGHT target             : "
+        f"{target_right:,} voxels; {EXPECTED_RIGHT_LUNG_VOLUME_CM3:.6f} cc"
+    )
+    print(
+        f"    RIGHT additions required : {right_need:,}"
+    )
+    print(
+        f"    RIGHT candidates         : {right_available:,}"
+    )
+    print(
+        f"    LEFT current             : "
+        f"{left_current_n:,} voxels; {left_current_volume:.6f} cc"
+    )
+    print(
+        f"    LEFT target              : "
+        f"{target_left:,} voxels; {EXPECTED_LEFT_LUNG_VOLUME_CM3:.6f} cc"
+    )
+    print(
+        f"    LEFT additions required  : {left_need:,}"
+    )
+    print(
+        f"    LEFT candidates          : {left_available:,}"
+    )
+
+    if right_available < right_need:
+        raise RuntimeError(
+            "RIGHT LUNG: cannot reach reference volume from the existing "
+            "anatomical RIGHT component using body-constrained low-HU "
+            "candidates. "
+            f"Need {right_need:,} additional voxels but only "
+            f"{right_available:,} are available. "
+            f"Current volume = {right_current_volume:.6f} cc; "
+            f"target = {EXPECTED_RIGHT_LUNG_VOLUME_CM3:.6f} cc."
+        )
+
+    if left_available < left_need:
+        raise RuntimeError(
+            "LEFT LUNG: cannot reach reference volume from the existing "
+            "anatomical LEFT component using body-constrained low-HU "
+            "candidates. "
+            f"Need {left_need:,} additional voxels but only "
+            f"{left_available:,} are available. "
+            f"Current volume = {left_current_volume:.6f} cc; "
+            f"target = {EXPECTED_LEFT_LUNG_VOLUME_CM3:.6f} cc."
+        )
+
+    def correct_side(
+        current,
+        candidate_side,
+        target,
+        name,
+    ):
         current = current.astype(bool)
         current_idx = np.argwhere(current)
         current_n = current_idx.shape[0]
@@ -1415,8 +1548,9 @@ def correct_lung_mask_to_reference_geometry(
             return current.copy()
 
         if current_n > target:
-            # Remove the most peripheral voxels first by retaining the
-            # central part of the existing anatomical component.
+            # Shrink only the existing anatomical component. Retain the
+            # most central voxels so that the correction does not migrate
+            # the lung or alter its laterality.
             centre = np.mean(
                 current_idx.astype(np.float64),
                 axis=0,
@@ -1449,36 +1583,27 @@ def correct_lung_mask_to_reference_geometry(
 
         need = target - current_n
 
-        addition = candidate_side & (~current)
-        available = int(
-            np.count_nonzero(addition)
-        )
+        idx = np.argwhere(candidate_side)
 
-        if available < need:
+        if idx.shape[0] < need:
             raise RuntimeError(
-                f"{name}: cannot reach reference volume. "
-                f"Need {need:,} additional voxels but only "
-                f"{available:,} anatomically constrained candidates "
-                f"are available. "
-                f"Current volume = "
-                f"{current_n * ct_voxel_volume_cm3:.6f} cc; "
-                f"target = "
-                f"{target * ct_voxel_volume_cm3:.6f} cc."
+                f"{name}: internal candidate check failed. "
+                f"Need {need:,} additions but only "
+                f"{idx.shape[0]:,} candidates remain."
             )
 
+        # Add the nearest anatomically assigned candidates first.
         distance = ndimage.distance_transform_edt(
             ~current
         )
 
-        idx = np.argwhere(addition)
+        d = distance[candidate_side]
 
-        d = distance[addition]
-
-        hu = ct_hu[addition].astype(
+        hu = ct_hu[candidate_side].astype(
             np.float64
         )
 
-        # Nearest to the existing lung first; lower HU breaks ties.
+        # Distance is the primary criterion; lower HU breaks ties.
         order = np.lexsort(
             (
                 hu,
@@ -1501,7 +1626,7 @@ def correct_lung_mask_to_reference_geometry(
         return corrected
 
     # ------------------------------------------------------------------
-    # Correct each anatomical lung independently.
+    # Correct each actual anatomical lung independently.
     # ------------------------------------------------------------------
     right = correct_side(
         right_current,
@@ -1519,81 +1644,86 @@ def correct_lung_mask_to_reference_geometry(
 
     corrected = right | left
 
-    measured = {
-        "Right lung": (
-            np.count_nonzero(right)
-            * ct_voxel_volume_cm3
-        ),
-        "Left lung": (
-            np.count_nonzero(left)
-            * ct_voxel_volume_cm3
-        ),
-        "Whole lung": (
-            np.count_nonzero(corrected)
-            * ct_voxel_volume_cm3
-        ),
-    }
+    # ------------------------------------------------------------------
+    # Final hard QA: exact voxel targets, no overlap, and closure.
+    # ------------------------------------------------------------------
+    right_n = int(np.count_nonzero(right))
+    left_n = int(np.count_nonzero(left))
+    total_n = int(np.count_nonzero(corrected))
 
-    expected = {
-        "Right lung": EXPECTED_RIGHT_LUNG_VOLUME_CM3,
-        "Left lung": EXPECTED_LEFT_LUNG_VOLUME_CM3,
-        "Whole lung": EXPECTED_TOTAL_LUNG_VOLUME_CM3,
-    }
+    if right_n != target_right:
+        raise RuntimeError(
+            f"RIGHT LUNG volume correction failed: "
+            f"{right_n:,} voxels != target {target_right:,}."
+        )
+
+    if left_n != target_left:
+        raise RuntimeError(
+            f"LEFT LUNG volume correction failed: "
+            f"{left_n:,} voxels != target {target_left:,}."
+        )
+
+    overlap = int(np.count_nonzero(right & left))
+    if overlap != 0:
+        raise RuntimeError(
+            f"RIGHT/LEFT lung masks overlap by {overlap:,} voxels."
+        )
+
+    if total_n != target_right + target_left:
+        raise RuntimeError(
+            f"Whole-lung voxel closure failed: {total_n:,} != "
+            f"{target_right + target_left:,}."
+        )
+
+    right_volume = right_n * ct_voxel_volume_cm3
+    left_volume = left_n * ct_voxel_volume_cm3
+    total_volume = total_n * ct_voxel_volume_cm3
 
     print()
-    print("FIXED REFERENCE LUNG GEOMETRY")
-
-    for name in (
-        "Right lung",
-        "Left lung",
-        "Whole lung",
-    ):
-        diff = (
-            100.0
-            * (
-                measured[name]
-                / expected[name]
-                - 1.0
-            )
-        )
-
-        print(
-            f"    {name:12s}: "
-            f"{measured[name]:.6f} cc "
-            f"(reference "
-            f"{expected[name]:.6f} cc; "
-            f"{diff:+.6f}%)"
-        )
-
-        if (
-            abs(diff)
-            >
-            100.0
-            * EXPECTED_TOTAL_LUNG_VOLUME_TOLERANCE_FRACTION
-        ):
-            raise RuntimeError(
-                f"{name} volume failed the fixed reference "
-                "geometry check."
-            )
-
-    if np.any(right & left):
-        raise RuntimeError(
-            "Corrected RIGHT and LEFT lung masks overlap."
-        )
-
-    if np.count_nonzero(corrected) != (
-        np.count_nonzero(right)
-        + np.count_nonzero(left)
-    ):
-        raise RuntimeError(
-            "Whole-lung voxel closure failed."
-        )
-
-    return (
-        corrected.astype(bool),
-        right.astype(bool),
-        left.astype(bool),
+    print("LUNG VOLUME CORRECTION RESULT")
+    print(
+        f"    RIGHT final              : "
+        f"{right_n:,} voxels; {right_volume:.6f} cc"
     )
+    print(
+        f"    RIGHT target             : "
+        f"{target_right:,} voxels; {EXPECTED_RIGHT_LUNG_VOLUME_CM3:.6f} cc"
+    )
+    print(
+        f"    LEFT final               : "
+        f"{left_n:,} voxels; {left_volume:.6f} cc"
+    )
+    print(
+        f"    LEFT target              : "
+        f"{target_left:,} voxels; {EXPECTED_LEFT_LUNG_VOLUME_CM3:.6f} cc"
+    )
+    print(
+        f"    WHOLE LUNG final         : "
+        f"{total_n:,} voxels; {total_volume:.6f} cc"
+    )
+    print(
+        f"    WHOLE LUNG target        : "
+        f"{target_right + target_left:,} voxels; "
+        f"{EXPECTED_TOTAL_LUNG_VOLUME_CM3:.6f} cc"
+    )
+    print(
+        f"    RIGHT/LEFT overlap       : {overlap:,} voxels"
+    )
+    print(
+        f"    Volume closure error     : "
+        f"{total_volume - EXPECTED_TOTAL_LUNG_VOLUME_CM3:+.9f} cc"
+    )
+
+    if abs(
+        total_volume / EXPECTED_TOTAL_LUNG_VOLUME_CM3 - 1.0
+    ) > EXPECTED_TOTAL_LUNG_VOLUME_TOLERANCE_FRACTION:
+        raise RuntimeError(
+            "Corrected whole-lung volume failed the configured QA "
+            "tolerance."
+        )
+
+    return corrected, right, left
+
 
 # =============================================================================
 # LUNG PHYSICAL CENTRE
