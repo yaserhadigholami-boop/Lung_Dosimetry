@@ -1265,8 +1265,49 @@ def correct_lung_mask_to_reference_geometry(
     )
     x_mid = 0.5 * (np.min(body_x) + np.max(body_x))
 
-    right_selector = patient_x <= x_mid
-    left_selector = patient_x > x_mid
+    side_a_selector = patient_x <= x_mid
+    side_b_selector = patient_x > x_mid
+
+    # Determine which physical half corresponds to the requested anatomical
+    # RIGHT/LEFT labels from the existing segmented volumes. This is important
+    # because the CT direction cosines can reverse the apparent X sign.
+    side_a_current_n = int(np.count_nonzero(lung_mask & side_a_selector))
+    side_b_current_n = int(np.count_nonzero(lung_mask & side_b_selector))
+
+    side_a_current_volume = side_a_current_n * ct_voxel_volume_cm3
+    side_b_current_volume = side_b_current_n * ct_voxel_volume_cm3
+
+    right_is_a = (
+        abs(side_a_current_volume - EXPECTED_RIGHT_LUNG_VOLUME_CM3)
+        <=
+        abs(side_b_current_volume - EXPECTED_RIGHT_LUNG_VOLUME_CM3)
+    )
+
+    if right_is_a:
+        right_selector = side_a_selector
+        left_selector = side_b_selector
+    else:
+        right_selector = side_b_selector
+        left_selector = side_a_selector
+
+    print()
+    print("LUNG SIDE ASSIGNMENT AUDIT")
+    print(
+        f"    Physical-X half A current volume : "
+        f"{side_a_current_volume:.6f} cc"
+    )
+    print(
+        f"    Physical-X half B current volume : "
+        f"{side_b_current_volume:.6f} cc"
+    )
+    print(
+        f"    Assigned RIGHT current volume     : "
+        f"{max(side_a_current_volume, side_b_current_volume) if right_is_a else min(side_a_current_volume, side_b_current_volume):.6f} cc"
+    )
+    print(
+        f"    Assigned LEFT current volume      : "
+        f"{min(side_a_current_volume, side_b_current_volume) if right_is_a else max(side_a_current_volume, side_b_current_volume):.6f} cc"
+    )
 
     def correct_side(current, candidate_side, target, name):
         current_idx = np.argwhere(current)
