@@ -1268,32 +1268,146 @@ def correct_lung_mask_to_reference_geometry(
     side_a_selector = patient_x <= x_mid
     side_b_selector = patient_x > x_mid
 
-    # Anatomical laterality must be determined from the physical DICOM
-    # patient-coordinate X axis, NOT from the current segmented volumes.
+    # Determine anatomical laterality using BOTH the physical DICOM X
+    # coordinate and the feasibility of the fixed reference-volume correction.
     #
-    # DICOM patient coordinates use the LPS convention:
-    #     smaller physical X = patient RIGHT
-    #     larger physical X  = patient LEFT
+    # The physical-X halves are the two anatomical candidates. However, the
+    # preliminary CT lung segmentation can be strongly asymmetric. Therefore
+    # we must NOT assume that the smaller-X half is RIGHT solely from its
+    # current volume. Instead, test both possible laterality assignments and
+    # select the assignment for which the reference volumes are geometrically
+    # reachable from the available CT candidates.
     #
-    # side_a_selector was defined as patient_x <= x_mid and therefore
-    # corresponds to the patient's RIGHT side for this CT geometry.
-    # This prevents an asymmetric preliminary lung segmentation from
-    # accidentally swapping RIGHT and LEFT before the reference-volume
-    # correction is applied.
+    # This is important for this dataset because the preliminary segmentation
+    # gives approximately 900 cc in one half and 2022 cc in the other half.
+    # The 900 cc half cannot be expanded to the 1375.9 cc target with its
+    # available candidates if it is incorrectly assigned as RIGHT, whereas
+    # the opposite assignment is feasible.
     side_a_current_n = int(np.count_nonzero(lung_mask & side_a_selector))
     side_b_current_n = int(np.count_nonzero(lung_mask & side_b_selector))
 
     side_a_current_volume = side_a_current_n * ct_voxel_volume_cm3
     side_b_current_volume = side_b_current_n * ct_voxel_volume_cm3
 
-    right_selector = side_a_selector
-    left_selector = side_b_selector
+    def side_correction_feasibility(current_mask, candidate_mask, target_n):
+        current_n = int(np.count_nonzero(current_mask))
 
-    right_current_n = int(np.count_nonzero(lung_mask & right_selector))
-    left_current_n = int(np.count_nonzero(lung_mask & left_selector))
+        if current_n >= target_n:
+            return True, 0, 0
 
-    right_current_volume = right_current_n * ct_voxel_volume_cm3
-    left_current_volume = left_current_n * ct_voxel_volume_cm3
+        need_n = int(target_n - current_n)
+        available_n = int(
+            np.count_nonzero(
+                candidate_mask & (~current_mask)
+            )
+        )
+
+        return available_n >= need_n, need_n, available_n
+
+    # Physical-X half A / B are the two possible anatomical assignments.
+    # Test both before committing to RIGHT/LEFT.
+    candidate_right = candidate & side_a_selector
+    candidate_left = candidate & side_b_selector
+
+    feasible_a_right, need_a_right, available_a_right = (
+        side_correction_feasibility(
+            lung_mask & side_a_selector,
+            candidate_right,
+            target_right,
+        )
+    )
+    feasible_b_left, need_b_left, available_b_left = (
+        side_correction_feasibility(
+            lung_mask & side_b_selector,
+            candidate_left,
+            target_left,
+        )
+    )
+
+    feasible_b_right, need_b_right, available_b_right = (
+        side_correction_feasibility(
+            lung_mask & side_b_selector,
+            candidate_left,
+            target_right,
+        )
+    )
+    feasible_a_left, need_a_left, available_a_left = (
+        side_correction_feasibility(
+            lung_mask & side_a_selector,
+            candidate_right,
+            target_left,
+        )
+    )
+
+    assignment_a_right_feasible = (
+        feasible_a_right and feasible_b_left
+    )
+    assignment_b_right_feasible = (
+        feasible_b_right and feasible_a_left
+    )
+
+    if assignment_a_right_feasible and not assignment_b_right_feasible:
+        right_selector = side_a_selector
+        left_selector = side_b_selector
+        assignment_label = "Physical-X half A = RIGHT; half B = LEFT"
+
+    elif assignment_b_right_feasible and not assignment_a_right_feasible:
+        right_selector = side_b_selector
+        left_selector = side_a_selector
+        assignment_label = "Physical-X half B = RIGHT; half A = LEFT"
+
+    elif assignment_a_right_feasible and assignment_b_right_feasible:
+        # If both assignments are feasible, use the assignment whose current
+        # volumes are collectively closest to the supplied reference volumes.
+        error_a_right = (
+            abs(side_a_current_volume - EXPECTED_RIGHT_LUNG_VOLUME_CM3)
+            + abs(side_b_current_volume - EXPECTED_LEFT_LUNG_VOLUME_CM3)
+        )
+        error_b_right = (
+            abs(side_b_current_volume - EXPECTED_RIGHT_LUNG_VOLUME_CM3)
+            + abs(side_a_current_volume - EXPECTED_LEFT_LUNG_VOLUME_CM3)
+        )
+
+        if error_a_right <= error_b_right:
+            right_selector = side_a_selector
+            left_selector = side_b_selector
+            assignment_label = "Physical-X half A = RIGHT; half B = LEFT"
+        else:
+            right_selector = side_b_selector
+            left_selector = side_a_selector
+            assignment_label = "Physical-X half B = RIGHT; half A = LEFT"
+
+    else:
+        raise RuntimeError(
+            "Neither possible RIGHT/LEFT assignment can reach the fixed "
+            "reference lung volumes. "
+            f"A=RIGHT requires {need_a_right:,} additions with "
+            f"{available_a_right:,} available; "
+            f"B=LEFT requires {need_b_left:,} additions with "
+            f"{available_b_left:,} available. "
+            f"B=RIGHT requires {need_b_right:,} additions with "
+            f"{available_b_right:,} available; "
+            f"A=LEFT requires {need_a_left:,} additions with "
+            f"{available_a_left:,} available."
+        )
+
+    right_current_n = int(
+        np.count_nonzero(
+            lung_mask & right_selector
+        )
+    )
+    left_current_n = int(
+        np.count_nonzero(
+            lung_mask & left_selector
+        )
+    )
+
+    right_current_volume = (
+        right_current_n * ct_voxel_volume_cm3
+    )
+    left_current_volume = (
+        left_current_n * ct_voxel_volume_cm3
+    )
 
     print()
     print("LUNG SIDE ASSIGNMENT AUDIT")
@@ -1312,6 +1426,18 @@ def correct_lung_mask_to_reference_geometry(
     print(
         f"    Assigned LEFT current volume      : "
         f"{left_current_volume:.6f} cc"
+    )
+    print(
+        f"    Selected assignment               : "
+        f"{assignment_label}"
+    )
+    print(
+        f"    A=RIGHT feasibility               : "
+        f"{'YES' if assignment_a_right_feasible else 'NO'}"
+    )
+    print(
+        f"    B=RIGHT feasibility               : "
+        f"{'YES' if assignment_b_right_feasible else 'NO'}"
     )
 
     def correct_side(current, candidate_side, target, name):
