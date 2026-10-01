@@ -142,9 +142,20 @@ EXPECTED_SEGMENT_VOLUME_TOLERANCE_FRACTION = 0.05
 # Approximate anatomical total lung volume supplied for this dataset:
 # treated segment (~181.15 cc) + left lung excluding segment (~945 cc)
 # + right lung (~1350 cc). Used for whole-lung QA only.
-EXPECTED_TOTAL_LUNG_VOLUME_CM3 = 181.15 + 945.0 + 1350.0
-EXPECTED_TOTAL_LUNG_MASS_G = EXPECTED_TOTAL_LUNG_VOLUME_CM3 * LUNG_DENSITY_G_CM3
-EXPECTED_TOTAL_LUNG_VOLUME_TOLERANCE_FRACTION = 0.10
+EXPECTED_RIGHT_LUNG_VOLUME_CM3 = 1681.5
+EXPECTED_LEFT_LUNG_VOLUME_CM3 = 1375.9
+EXPECTED_TOTAL_LUNG_VOLUME_CM3 = (
+    EXPECTED_RIGHT_LUNG_VOLUME_CM3
+    + EXPECTED_LEFT_LUNG_VOLUME_CM3
+)
+EXPECTED_TOTAL_LUNG_MASS_G = (
+    EXPECTED_TOTAL_LUNG_VOLUME_CM3 * LUNG_DENSITY_G_CM3
+)
+EXPECTED_TOTAL_LUNG_VOLUME_TOLERANCE_FRACTION = 0.002
+
+# The same fixed anatomical geometry is used for BOTH Y-90 and Lu-177.
+# This correction is performed once, before either isotope is calculated.
+APPLY_REFERENCE_LUNG_VOLUME_CORRECTION = True
 
 # SEGMENT geometry is expected to be preserved through registration/resampling.
 # Do not artificially dilate or shrink the SEGMENT. A large loss indicates a
@@ -155,7 +166,7 @@ FAIL_ON_SEGMENT_VOLUME_LOSS = True
 # reference rather than a forced target. Keep the tolerance relatively broad
 # because CT segmentation thresholds and inclusion/exclusion of airways can
 # change the measured anatomical volume.
-FAIL_ON_LUNG_VOLUME_QA = False
+FAIL_ON_LUNG_VOLUME_QA = True
 
 DENSITY_SCALE_KERNEL = True
 
@@ -1180,6 +1191,181 @@ def make_lung_mask(
 
 
 # =============================================================================
+# =============================================================================
+# FIXED REFERENCE LUNG GEOMETRY CORRECTION / AUDIT
+# =============================================================================
+
+def correct_lung_mask_to_reference_geometry(
+    ct_hu,
+    lung_mask,
+    ct_affine,
+    ct_voxel_volume_cm3,
+):
+    """Make one fixed, isotope-independent anatomical lung mask."""
+
+    if not APPLY_REFERENCE_LUNG_VOLUME_CORRECTION:
+        return lung_mask.astype(bool), None, None
+
+    if ct_voxel_volume_cm3 <= 0:
+        raise RuntimeError("Invalid CT voxel volume.")
+
+    target_right = int(np.rint(
+        EXPECTED_RIGHT_LUNG_VOLUME_CM3 / ct_voxel_volume_cm3
+    ))
+    target_left = int(np.rint(
+        EXPECTED_LEFT_LUNG_VOLUME_CM3 / ct_voxel_volume_cm3
+    ))
+
+    structure = ndimage.generate_binary_structure(3, 1)
+
+    body_candidate = (
+        np.isfinite(ct_hu)
+        & (ct_hu > -500.0)
+    )
+    body_candidate = ndimage.binary_closing(
+        body_candidate,
+        structure=structure,
+        iterations=2,
+    )
+
+    labels, n = ndimage.label(
+        body_candidate,
+        structure=structure,
+    )
+    if n == 0:
+        raise RuntimeError(
+            "Could not identify patient body for lung-volume correction."
+        )
+
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+    body_mask = labels == int(np.argmax(sizes))
+    body_filled = ndimage.binary_fill_holes(body_mask)
+
+    candidate = (
+        np.isfinite(ct_hu)
+        & (ct_hu >= LUNG_HU_MIN)
+        & (ct_hu <= LUNG_HU_MAX)
+        & body_filled
+    )
+
+    # DICOM patient X: smaller X = patient right; larger X = patient left.
+    zz, yy, xx = np.indices(ct_hu.shape, dtype=np.float32)
+    patient_x = (
+        float(ct_affine[0, 0]) * xx
+        + float(ct_affine[0, 1]) * yy
+        + float(ct_affine[0, 2]) * zz
+    )
+
+    body_idx = np.argwhere(body_mask)
+    body_x = (
+        float(ct_affine[0, 0]) * body_idx[:, 2]
+        + float(ct_affine[0, 1]) * body_idx[:, 1]
+        + float(ct_affine[0, 2]) * body_idx[:, 0]
+    )
+    x_mid = 0.5 * (np.min(body_x) + np.max(body_x))
+
+    right_selector = patient_x <= x_mid
+    left_selector = patient_x > x_mid
+
+    def correct_side(current, candidate_side, target, name):
+        current_idx = np.argwhere(current)
+        current_n = current_idx.shape[0]
+
+        if current_n == target:
+            return current.copy()
+
+        if current_n > target:
+            # Remove peripheral voxels first by retaining the central part
+            # of the existing segmented lung.
+            centre = np.mean(current_idx.astype(np.float64), axis=0)
+            dist2 = np.sum(
+                (current_idx.astype(np.float64) - centre) ** 2,
+                axis=1,
+            )
+            selected = current_idx[np.argsort(dist2)[:target]]
+            corrected = np.zeros_like(current, dtype=bool)
+            corrected[
+                selected[:, 0],
+                selected[:, 1],
+                selected[:, 2],
+            ] = True
+            return corrected
+
+        need = target - current_n
+        addition = candidate_side & (~current)
+        available = int(np.count_nonzero(addition))
+
+        if available < need:
+            raise RuntimeError(
+                f"{name}: cannot reach reference volume. "
+                f"Need {need:,} additional voxels but only "
+                f"{available:,} candidates are available."
+            )
+
+        distance = ndimage.distance_transform_edt(~current)
+        idx = np.argwhere(addition)
+        d = distance[addition]
+        hu = ct_hu[addition].astype(np.float64)
+
+        # Nearest to existing lung first; lower HU breaks ties.
+        order = np.lexsort((hu, d))
+        selected = idx[order[:need]]
+
+        corrected = current.copy()
+        corrected[
+            selected[:, 0],
+            selected[:, 1],
+            selected[:, 2],
+        ] = True
+        return corrected
+
+    right = correct_side(
+        lung_mask & right_selector,
+        candidate & right_selector,
+        target_right,
+        "RIGHT LUNG",
+    )
+
+    left = correct_side(
+        lung_mask & left_selector,
+        candidate & left_selector,
+        target_left,
+        "LEFT LUNG",
+    )
+
+    corrected = right | left
+
+    measured = {
+        "Right lung": np.count_nonzero(right) * ct_voxel_volume_cm3,
+        "Left lung": np.count_nonzero(left) * ct_voxel_volume_cm3,
+        "Whole lung": np.count_nonzero(corrected) * ct_voxel_volume_cm3,
+    }
+    expected = {
+        "Right lung": EXPECTED_RIGHT_LUNG_VOLUME_CM3,
+        "Left lung": EXPECTED_LEFT_LUNG_VOLUME_CM3,
+        "Whole lung": EXPECTED_TOTAL_LUNG_VOLUME_CM3,
+    }
+
+    print()
+    print("FIXED REFERENCE LUNG GEOMETRY")
+    for name in ("Right lung", "Left lung", "Whole lung"):
+        diff = 100.0 * (measured[name] / expected[name] - 1.0)
+        print(
+            f"    {name:12s}: {measured[name]:.6f} cc "
+            f"(reference {expected[name]:.6f} cc; {diff:+.6f}%)"
+        )
+        if abs(diff) > 100.0 * EXPECTED_TOTAL_LUNG_VOLUME_TOLERANCE_FRACTION:
+            raise RuntimeError(
+                f"{name} volume failed the fixed reference geometry check."
+            )
+
+    if np.any(right & left):
+        raise RuntimeError("Right and left lung masks overlap.")
+
+    return corrected, right, left
+
+
 # CT HU -> VOXEL-WISE DENSITY
 # =============================================================================
 
@@ -4010,6 +4196,47 @@ def register_spect_to_ct(
         "affine"
     ]
 
+    right_lung_volume_cm3 = (
+        np.count_nonzero(right_lung_mask)
+        * ct_voxel_volume_cm3
+    )
+    left_lung_volume_cm3 = (
+        np.count_nonzero(left_lung_mask)
+        * ct_voxel_volume_cm3
+    )
+
+    print()
+    print("FIXED CT LUNG GEOMETRY AUDIT")
+    print(f"    Right lung : {right_lung_volume_cm3:.6f} cc")
+    print(f"    Left lung  : {left_lung_volume_cm3:.6f} cc")
+    print(f"    Whole lung : {initial_lung_volume_cm3:.6f} cc")
+    print(f"    Expected right: {EXPECTED_RIGHT_LUNG_VOLUME_CM3:.6f} cc")
+    print(f"    Expected left : {EXPECTED_LEFT_LUNG_VOLUME_CM3:.6f} cc")
+    print(f"    Expected whole: {EXPECTED_TOTAL_LUNG_VOLUME_CM3:.6f} cc")
+
+    geometry_df = pd.DataFrame([
+        ["Right lung", np.count_nonzero(right_lung_mask),
+         right_lung_volume_cm3, EXPECTED_RIGHT_LUNG_VOLUME_CM3],
+        ["Left lung", np.count_nonzero(left_lung_mask),
+         left_lung_volume_cm3, EXPECTED_LEFT_LUNG_VOLUME_CM3],
+        ["Whole lung", np.count_nonzero(lung_mask),
+         initial_lung_volume_cm3, EXPECTED_TOTAL_LUNG_VOLUME_CM3],
+    ], columns=[
+        "Region", "Voxels", "Volume_cc", "Expected_volume_cc"
+    ])
+    geometry_df["Difference_percent"] = (
+        100.0
+        * (
+            geometry_df["Volume_cc"]
+            / geometry_df["Expected_volume_cc"]
+            - 1.0
+        )
+    )
+    geometry_df.to_csv(
+        OUTPUT_DIR / "lung_geometry_reference_audit.csv",
+        index=False,
+    )
+
     lung_centre_patient = (
         calculate_lung_physical_centre(
             lung_mask,
@@ -6383,6 +6610,100 @@ def build_cartesian_kernel(
 
 
 # =============================================================================
+# =============================================================================
+# CARTESIAN DPK NUMERICAL / ENERGY AUDIT
+# =============================================================================
+
+def audit_cartesian_kernel(
+    kernel,
+    shell_energy_mev,
+    total_kernel_energy_mev,
+    kernel_voxel_mass_g,
+    isotope,
+):
+    """Independent checks of the Cartesian Graves DPK."""
+
+    k = np.asarray(kernel, dtype=np.float64)
+    selected_energy = float(np.sum(shell_energy_mev, dtype=np.float64))
+
+    finite_fraction = (
+        np.count_nonzero(np.isfinite(k)) / k.size
+        if k.size else 0.0
+    )
+    negative_voxels = int(np.count_nonzero(k < 0.0))
+    positive_voxels = int(np.count_nonzero(k > 0.0))
+
+    centre = tuple(int(n // 2) for n in k.shape)
+    centre_value = float(k[centre])
+
+    mirror = k[::-1, ::-1, ::-1]
+    symmetry_abs = float(np.max(np.abs(k - mirror)))
+    symmetry_relative = (
+        symmetry_abs / max(float(np.max(np.abs(k))), 1.0e-30)
+    )
+
+    cartesian_energy_mev = float(
+        np.sum(k, dtype=np.float64)
+        * kernel_voxel_mass_g
+        / MEV_PER_G_TO_GY
+    )
+    cartesian_to_selected = (
+        cartesian_energy_mev / selected_energy
+        if selected_energy > 0 else np.nan
+    )
+    selected_fraction_full = (
+        selected_energy / total_kernel_energy_mev
+        if total_kernel_energy_mev > 0 else np.nan
+    )
+
+    print()
+    print(f"{isotope} CARTESIAN KERNEL AUDIT")
+    print(f"    Finite fraction          : {finite_fraction:.12f}")
+    print(f"    Negative voxels          : {negative_voxels:,}")
+    print(f"    Positive voxels          : {positive_voxels:,}")
+    print(f"    Centre kernel value      : {centre_value:.8e} Gy/decay")
+    print(f"    Symmetry relative error  : {symmetry_relative:.8e}")
+    print(f"    Selected radial energy   : {selected_energy:.8f} MeV/decay")
+    print(f"    Full radial energy       : {total_kernel_energy_mev:.8f} MeV/decay")
+    print(f"    Selected/full fraction   : {selected_fraction_full:.8f}")
+    print(f"    Cartesian energy         : {cartesian_energy_mev:.8f} MeV/decay")
+    print(f"    Cartesian/selected ratio : {cartesian_to_selected:.8f}")
+
+    if finite_fraction < 1.0:
+        raise RuntimeError(f"{isotope} kernel contains non-finite values.")
+    if negative_voxels:
+        raise RuntimeError(f"{isotope} kernel contains negative values.")
+    if centre_value <= 0.0:
+        raise RuntimeError(f"{isotope} kernel centre voxel is not positive.")
+
+    if (
+        not np.isfinite(cartesian_to_selected)
+        or abs(cartesian_to_selected - 1.0) > 0.02
+    ):
+        print(
+            "WARNING: Cartesian kernel energy differs from selected radial "
+            "energy by >2%."
+        )
+
+    if symmetry_relative > 1.0e-5:
+        print(
+            "WARNING: Cartesian kernel symmetry differs by >1e-5 relative."
+        )
+
+    return {
+        "kernel_finite_fraction": finite_fraction,
+        "kernel_negative_voxels": negative_voxels,
+        "kernel_positive_voxels": positive_voxels,
+        "kernel_centre_Gy_per_decay": centre_value,
+        "kernel_symmetry_relative": symmetry_relative,
+        "kernel_selected_energy_MeV_per_decay": selected_energy,
+        "kernel_full_energy_MeV_per_decay": total_kernel_energy_mev,
+        "kernel_selected_fraction_of_full": selected_fraction_full,
+        "kernel_cartesian_energy_MeV_per_decay": cartesian_energy_mev,
+        "kernel_cartesian_to_selected_ratio": cartesian_to_selected,
+    }
+
+
 # SOURCE CROPPING
 # =============================================================================
 
@@ -7414,6 +7735,13 @@ def save_statistics(
             "Reference_lung_volume_cm3": EXPECTED_TOTAL_LUNG_VOLUME_CM3,
             "Reference_lung_mass_g": EXPECTED_TOTAL_LUNG_MASS_G,
 
+            "Kernel_selected_energy_J": energy_audit["selected_kernel_energy_J"],
+            "Kernel_full_energy_J": energy_audit["full_kernel_energy_J"],
+            "Raw_convolution_energy_J": energy_audit["raw_convolution_energy_J"],
+            "Raw_convolution_to_selected_ratio": energy_audit["raw_convolution_to_selected_ratio"],
+            "Kernel_cartesian_to_selected_ratio": energy_audit["kernel_audit"]["kernel_cartesian_to_selected_ratio"],
+            "Kernel_selected_fraction_of_full": energy_audit["kernel_audit"]["kernel_selected_fraction_of_full"],
+            "Kernel_symmetry_relative": energy_audit["kernel_audit"]["kernel_symmetry_relative"],
             "Total_cumulative_decays": energy_audit["total_decays"],
             "Kernel_energy_MeV_per_decay": energy_audit["kernel_energy_MeV_per_decay"],
             "Total_kernel_energy_J": energy_audit["total_kernel_energy_J"],
@@ -7493,6 +7821,14 @@ def run_isotope(
         isotope
     )
 
+    kernel_audit = audit_cartesian_kernel(
+        kernel,
+        shell_energy_mev,
+        total_kernel_energy_mev,
+        kernel_voxel_mass_g,
+        isotope,
+    )
+
     # The source is required to contain exactly the requested activity and
     # must contain no activity outside SEGMENT.
     source_activity_Bq = float(np.sum(activity_Bq, dtype=np.float64))
@@ -7517,6 +7853,52 @@ def run_isotope(
         spacing_mm,
         kernel_radius_cm
     )
+
+    # ------------------------------------------------------------------
+    # RAW CONVOLUTION ENERGY CONSERVATION CHECK
+    # ------------------------------------------------------------------
+    reference_voxel_mass_kg = kernel_voxel_mass_g / 1000.0
+
+    raw_convolution_energy_J = float(
+        np.sum(
+            dose.astype(np.float64),
+            dtype=np.float64
+        )
+        * reference_voxel_mass_kg
+    )
+
+    selected_kernel_energy_J = (
+        total_decays
+        * float(np.sum(shell_energy_mev, dtype=np.float64))
+        * MEV_TO_J
+    )
+
+    full_kernel_energy_J = (
+        total_decays
+        * total_kernel_energy_mev
+        * MEV_TO_J
+    )
+
+    raw_convolution_to_selected_ratio = (
+        raw_convolution_energy_J / selected_kernel_energy_J
+        if selected_kernel_energy_J > 0 else np.nan
+    )
+
+    print()
+    print(f"{isotope} RAW CONVOLUTION ENERGY AUDIT")
+    print(f"    Selected kernel energy       : {selected_kernel_energy_J:.8e} J")
+    print(f"    Full kernel energy           : {full_kernel_energy_J:.8e} J")
+    print(f"    Convolution grid energy      : {raw_convolution_energy_J:.8e} J")
+    print(f"    Grid/selected ratio          : {raw_convolution_to_selected_ratio:.8f}")
+
+    if (
+        not np.isfinite(raw_convolution_to_selected_ratio)
+        or abs(raw_convolution_to_selected_ratio - 1.0) > 0.03
+    ):
+        print(
+            "WARNING: convolution energy differs from the selected kernel "
+            "energy by >3%; inspect finite-grid truncation and normalisation."
+        )
 
     # ------------------------------------------------------------------
     # CT-density correction
@@ -7855,6 +8237,11 @@ def run_isotope(
     )
 
     energy_audit = {
+        "kernel_audit": kernel_audit,
+        "selected_kernel_energy_J": float(selected_kernel_energy_J),
+        "full_kernel_energy_J": float(full_kernel_energy_J),
+        "raw_convolution_energy_J": float(raw_convolution_energy_J),
+        "raw_convolution_to_selected_ratio": float(raw_convolution_to_selected_ratio),
         "total_decays": total_decays,
         "kernel_energy_MeV_per_decay": float(total_kernel_energy_mev),
         "total_kernel_energy_J": float(total_kernel_energy_J),
@@ -7907,6 +8294,14 @@ def run_isotope(
         "kernel_transport_model": "Reference-density Graves DPK with global density/radiological-distance scaling",
         "lung_density_g_cm3": float(np.mean(density_for_dose[lung_mask])),
         "kernel_total_energy_MeV_per_decay": float(total_kernel_energy_mev),
+        "kernel_selected_energy_MeV_per_decay": float(np.sum(shell_energy_mev, dtype=np.float64)),
+        "kernel_cartesian_to_selected_ratio": float(kernel_audit["kernel_cartesian_to_selected_ratio"]),
+        "kernel_symmetry_relative": float(kernel_audit["kernel_symmetry_relative"]),
+        "kernel_centre_Gy_per_decay": float(kernel_audit["kernel_centre_Gy_per_decay"]),
+        "selected_kernel_energy_J": float(selected_kernel_energy_J),
+        "full_kernel_energy_J": float(full_kernel_energy_J),
+        "raw_convolution_energy_J": float(raw_convolution_energy_J),
+        "raw_convolution_to_selected_ratio": float(raw_convolution_to_selected_ratio),
         "kernel_voxel_mass_g": float(kernel_voxel_mass_g),
         "total_cumulative_decays": total_decays,
         "total_kernel_energy_J": total_kernel_energy_J,
@@ -8189,6 +8584,18 @@ def main():
         ct_hu
     )
 
+    # -------------------------------------------------------------------------
+    # FIXED ANATOMICAL GEOMETRY — SAME FOR Y-90 AND Lu-177
+    # -------------------------------------------------------------------------
+    lung_mask, right_lung_mask, left_lung_mask = (
+        correct_lung_mask_to_reference_geometry(
+            ct_hu,
+            lung_mask,
+            ct_affine,
+            abs(np.linalg.det(ct_affine)) / 1000.0,
+        )
+    )
+
     save_array(
         lung_mask.astype(
             np.uint8
@@ -8196,6 +8603,16 @@ def main():
         OUTPUT_DIR
         /
         "lung_mask.npy"
+    )
+
+    save_array(
+        right_lung_mask.astype(np.uint8),
+        OUTPUT_DIR / "right_lung_mask.npy"
+    )
+
+    save_array(
+        left_lung_mask.astype(np.uint8),
+        OUTPUT_DIR / "left_lung_mask.npy"
     )
 
     # -------------------------------------------------------------------------
@@ -8766,6 +9183,13 @@ def main():
 
     print(
         "    Lu177_dose_Gy.npy"
+    )
+
+    print(
+        "    right_lung_mask.npy / left_lung_mask.npy"
+    )
+    print(
+        "    lung_geometry_reference_audit.csv"
     )
 
     print(
