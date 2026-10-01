@@ -1268,27 +1268,32 @@ def correct_lung_mask_to_reference_geometry(
     side_a_selector = patient_x <= x_mid
     side_b_selector = patient_x > x_mid
 
-    # Determine which physical half corresponds to the requested anatomical
-    # RIGHT/LEFT labels from the existing segmented volumes. This is important
-    # because the CT direction cosines can reverse the apparent X sign.
+    # Anatomical laterality must be determined from the physical DICOM
+    # patient-coordinate X axis, NOT from the current segmented volumes.
+    #
+    # DICOM patient coordinates use the LPS convention:
+    #     smaller physical X = patient RIGHT
+    #     larger physical X  = patient LEFT
+    #
+    # side_a_selector was defined as patient_x <= x_mid and therefore
+    # corresponds to the patient's RIGHT side for this CT geometry.
+    # This prevents an asymmetric preliminary lung segmentation from
+    # accidentally swapping RIGHT and LEFT before the reference-volume
+    # correction is applied.
     side_a_current_n = int(np.count_nonzero(lung_mask & side_a_selector))
     side_b_current_n = int(np.count_nonzero(lung_mask & side_b_selector))
 
     side_a_current_volume = side_a_current_n * ct_voxel_volume_cm3
     side_b_current_volume = side_b_current_n * ct_voxel_volume_cm3
 
-    right_is_a = (
-        abs(side_a_current_volume - EXPECTED_RIGHT_LUNG_VOLUME_CM3)
-        <=
-        abs(side_b_current_volume - EXPECTED_RIGHT_LUNG_VOLUME_CM3)
-    )
+    right_selector = side_a_selector
+    left_selector = side_b_selector
 
-    if right_is_a:
-        right_selector = side_a_selector
-        left_selector = side_b_selector
-    else:
-        right_selector = side_b_selector
-        left_selector = side_a_selector
+    right_current_n = int(np.count_nonzero(lung_mask & right_selector))
+    left_current_n = int(np.count_nonzero(lung_mask & left_selector))
+
+    right_current_volume = right_current_n * ct_voxel_volume_cm3
+    left_current_volume = left_current_n * ct_voxel_volume_cm3
 
     print()
     print("LUNG SIDE ASSIGNMENT AUDIT")
@@ -1302,11 +1307,11 @@ def correct_lung_mask_to_reference_geometry(
     )
     print(
         f"    Assigned RIGHT current volume     : "
-        f"{max(side_a_current_volume, side_b_current_volume) if right_is_a else min(side_a_current_volume, side_b_current_volume):.6f} cc"
+        f"{right_current_volume:.6f} cc"
     )
     print(
         f"    Assigned LEFT current volume      : "
-        f"{min(side_a_current_volume, side_b_current_volume) if right_is_a else max(side_a_current_volume, side_b_current_volume):.6f} cc"
+        f"{left_current_volume:.6f} cc"
     )
 
     def correct_side(current, candidate_side, target, name):
